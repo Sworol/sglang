@@ -280,13 +280,14 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_track_seqlens = forward_batch.mamba_track_seqlens.cpu()
         prefix_lens = forward_batch.extend_prefix_lens.cpu()
 
-        if isinstance(self, Mamba2AttnBackend):
-            num_h_states = extend_seq_lens // mamba_cache_chunk_size
-        else:
-            num_h_states = (extend_seq_lens - 1) // mamba_cache_chunk_size + 1
-
-        track_ssm_src_offset = torch.zeros_like(num_h_states)
-        track_ssm_src_offset[1:] = torch.cumsum(num_h_states[:-1], dim=0)
+        # intermediate_states is indexed by a global chunk grid over the
+        # flattened extend batch (ceil(seqlen / chunk_size) slots), not by
+        # per-request local chunk counts.  Use the cumulative extend position
+        # to compute each request's offset: floor(prefix_pos[i] / chunk_size)
+        # gives the number of complete chunks before request i's extend starts.
+        prefix_pos = torch.zeros_like(extend_seq_lens)
+        prefix_pos[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
+        track_ssm_src_offset = prefix_pos // mamba_cache_chunk_size
 
         lens_to_track = mamba_track_seqlens - prefix_lens
         lens_masked = lens_to_track[mamba_track_mask]
