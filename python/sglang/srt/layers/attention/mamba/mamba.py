@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 
 from sglang.kernels.ops.mamba.triton_ops import (
+    chunk_state_varlen_by_bounds,
     mamba_chunk_scan_combined,
     selective_state_update,
 )
@@ -438,6 +439,48 @@ class MambaMixer2(torch.nn.Module):
 
         self.prefix = prefix
 
+    def _track_mamba2_state_extend(
+        self,
+        *,
+        ssm_state: torch.Tensor,
+        x: torch.Tensor,
+        B: torch.Tensor,
+        dt: torch.Tensor,
+        dA_cumsum: torch.Tensor,
+        chunk_states: torch.Tensor,
+        initial_states: Optional[torch.Tensor],
+        metadata: Mamba2Metadata,
+    ) -> None:
+        if (
+            metadata.track_ssm_varlen_dst is not None
+            and metadata.track_ssm_varlen_dst.numel() > 0
+        ):
+            track_initial_states = None
+            if initial_states is not None:
+                track_initial_states = initial_states[metadata.track_ssm_varlen_rows]
+
+            track_states = chunk_state_varlen_by_bounds(
+                B,
+                x,
+                dt,
+                dA_cumsum,
+                metadata.track_ssm_varlen_start_locs,
+                metadata.track_ssm_varlen_end_locs,
+                chunk_states,
+                initial_states=track_initial_states,
+            )
+            ssm_state[metadata.track_ssm_varlen_dst] = track_states.to(
+                ssm_state.dtype, copy=False
+            )
+
+        if (
+            metadata.track_ssm_final_src is not None
+            and metadata.track_ssm_final_src.numel() > 0
+        ):
+            ssm_state[metadata.track_ssm_final_dst] = ssm_state[
+                metadata.track_ssm_final_src
+            ]
+
     def forward(
         self,
         *,
@@ -600,8 +643,9 @@ class MambaMixer2(torch.nn.Module):
                     0,
                 )
 
+            track_ssm = metadata.has_mamba_track_mask
             # NOTE: final output is an in-place update of out tensor
-            intermediate_states, varlen_state = mamba_chunk_scan_combined(
+            scan_outputs = mamba_chunk_scan_combined(
                 hidden_states_p.view(
                     1, num_prefill_tokens, local_num_heads, self.head_dim
                 ),
@@ -621,6 +665,7 @@ class MambaMixer2(torch.nn.Module):
                 return_varlen_states=True,
                 return_final_states=False,
                 return_intermediate_states=True,
+                return_scan_intermediates=track_ssm,
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
                 out=preallocated_ssm_out_p.view(
@@ -628,11 +673,33 @@ class MambaMixer2(torch.nn.Module):
                 ),
                 state_dtype=ssm_state.dtype,
             )
+            if track_ssm:
+                (
+                    intermediate_states,
+                    varlen_state,
+                    scan_dt,
+                    scan_dA_cumsum,
+                ) = scan_outputs
+            else:
+                intermediate_states, varlen_state = scan_outputs
 
             # update ssm states
             # - varlen state is a (num_prefills, nheads, headdim, dstate) tensor
             if varlen_state is not None:
                 ssm_state[state_indices_tensor_p] = varlen_state
+            if track_ssm:
+                self._track_mamba2_state_extend(
+                    ssm_state=ssm_state,
+                    x=hidden_states_p.view(
+                        num_prefill_tokens, local_num_heads, self.head_dim
+                    ),
+                    B=B_p.view(num_prefill_tokens, local_num_groups, -1),
+                    dt=scan_dt.squeeze(0),
+                    dA_cumsum=scan_dA_cumsum.squeeze(0),
+                    chunk_states=intermediate_states.squeeze(0),
+                    initial_states=initial_states,
+                    metadata=metadata,
+                )
 
         # Process decode requests
         if has_decode:

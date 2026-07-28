@@ -268,6 +268,7 @@ def _chunk_state_varlen_kernel(
     dA_cumsum_ptr,
     chunk_states_ptr,
     cu_seqlens_ptr,
+    end_locs_ptr,
     states_ptr,
     initstates_ptr,
     # Matrix dimensions
@@ -303,6 +304,7 @@ def _chunk_state_varlen_kernel(
     stride_init_states_dstate,
     # Meta-parameters
     HAS_INITSTATES: tl.constexpr,
+    USE_BOUNDS: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr = 16,
     BLOCK_SIZE_N: tl.constexpr = 16,
     BLOCK_SIZE_K: tl.constexpr = 16,
@@ -312,7 +314,12 @@ def _chunk_state_varlen_kernel(
     num_pid_n = tl.cdiv(dstate, BLOCK_SIZE_N)
     pid_m = tl.program_id(axis=0) // num_pid_n
     pid_n = tl.program_id(axis=0) % num_pid_n
-    end_idx = tl.load(cu_seqlens_ptr + pid_b + 1)
+    if USE_BOUNDS:
+        start_idx = tl.load(cu_seqlens_ptr + pid_b)
+        end_idx = tl.load(end_locs_ptr + pid_b)
+    else:
+        start_idx = tl.load(cu_seqlens_ptr + pid_b)
+        end_idx = tl.load(cu_seqlens_ptr + pid_b + 1)
     pid_c = (end_idx - 1) // chunk_size
     b_ptr += (
         pid_c * chunk_size * stride_b_seqlen
@@ -347,7 +354,6 @@ def _chunk_state_varlen_kernel(
     dA_cumsum_ptrs = dA_cumsum_ptr + offs_k * stride_dA_cs_csize
 
     chunk_size_limit = end_idx - pid_c * chunk_size
-    start_idx = tl.load(cu_seqlens_ptr + pid_b)
     start_idx_cur = tl.maximum(start_idx - pid_c * chunk_size, 0)
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -565,14 +571,33 @@ def _chunk_state_fwd(
     return states
 
 
-def chunk_state_varlen(
-    B, x, dt, dA_cumsum, cu_seqlens, chunk_states, initial_states=None
+def _chunk_state_varlen(
+    B,
+    x,
+    dt,
+    dA_cumsum,
+    chunk_states,
+    *,
+    cu_seqlens=None,
+    start_locs=None,
+    end_locs=None,
+    initial_states=None,
 ):
     total_seqlen, nheads, headdim = x.shape
     _, nchunks, chunk_size = dt.shape
     _, ngroups, dstate = B.shape
-    batch = cu_seqlens.shape[0] - 1
-    cu_seqlens = cu_seqlens.contiguous()
+    use_bounds = start_locs is not None
+    if use_bounds:
+        assert end_locs is not None
+        assert start_locs.shape == end_locs.shape
+        batch = start_locs.shape[0]
+        cu_seqlens = start_locs.contiguous()
+        end_locs = end_locs.contiguous()
+    else:
+        assert cu_seqlens is not None
+        batch = cu_seqlens.shape[0] - 1
+        cu_seqlens = cu_seqlens.contiguous()
+        end_locs = cu_seqlens
     assert nheads % ngroups == 0
     assert B.shape == (total_seqlen, ngroups, dstate)
     assert dt.shape == (nheads, nchunks, chunk_size)
@@ -604,6 +629,7 @@ def chunk_state_varlen(
             dA_cumsum,
             chunk_states,
             cu_seqlens,
+            end_locs,
             states,
             initial_states,
             headdim,
@@ -642,5 +668,35 @@ def chunk_state_varlen(
                 else (0, 0, 0, 0)
             ),
             HAS_INITSTATES=initial_states is not None,
+            USE_BOUNDS=use_bounds,
         )
     return states
+
+
+def chunk_state_varlen(
+    B, x, dt, dA_cumsum, cu_seqlens, chunk_states, initial_states=None
+):
+    return _chunk_state_varlen(
+        B,
+        x,
+        dt,
+        dA_cumsum,
+        chunk_states,
+        cu_seqlens=cu_seqlens,
+        initial_states=initial_states,
+    )
+
+
+def chunk_state_varlen_by_bounds(
+    B, x, dt, dA_cumsum, start_locs, end_locs, chunk_states, initial_states=None
+):
+    return _chunk_state_varlen(
+        B,
+        x,
+        dt,
+        dA_cumsum,
+        chunk_states,
+        start_locs=start_locs,
+        end_locs=end_locs,
+        initial_states=initial_states,
+    )

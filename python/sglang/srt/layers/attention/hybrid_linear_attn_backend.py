@@ -70,6 +70,10 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_h_dst = None
         track_ssm_final_src = None
         track_ssm_final_dst = None
+        track_ssm_varlen_start_locs = None
+        track_ssm_varlen_end_locs = None
+        track_ssm_varlen_dst = None
+        track_ssm_varlen_rows = None
 
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
@@ -193,6 +197,10 @@ class MambaAttnBackendBase(AttentionBackend):
                         track_ssm_h_dst,
                         track_ssm_final_src,
                         track_ssm_final_dst,
+                        track_ssm_varlen_start_locs,
+                        track_ssm_varlen_end_locs,
+                        track_ssm_varlen_dst,
+                        track_ssm_varlen_rows,
                     ) = self._init_track_ssm_indices(mamba_cache_indices, forward_batch)
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
@@ -216,6 +224,10 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_h_dst=track_ssm_h_dst,
             track_ssm_final_src=track_ssm_final_src,
             track_ssm_final_dst=track_ssm_final_dst,
+            track_ssm_varlen_start_locs=track_ssm_varlen_start_locs,
+            track_ssm_varlen_end_locs=track_ssm_varlen_end_locs,
+            track_ssm_varlen_dst=track_ssm_varlen_dst,
+            track_ssm_varlen_rows=track_ssm_varlen_rows,
             has_mamba_track_mask=has_mamba_track_mask,
             replayssm_write_pos=replayssm_write_pos,
             replayssm_force_flush=replayssm_force_flush,
@@ -280,20 +292,25 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_track_seqlens = forward_batch.mamba_track_seqlens.cpu()
         prefix_lens = forward_batch.extend_prefix_lens.cpu()
 
-        # intermediate_states is indexed by a global chunk grid over the
-        # flattened extend batch (ceil(seqlen / chunk_size) slots), not by
-        # per-request local chunk counts.  Use the cumulative extend position
-        # to compute each request's offset: floor(prefix_pos[i] / chunk_size)
-        # gives the number of complete chunks before request i's extend starts.
-        prefix_pos = torch.zeros_like(extend_seq_lens)
-        prefix_pos[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
-        track_ssm_src_offset = prefix_pos // mamba_cache_chunk_size
-
         lens_to_track = mamba_track_seqlens - prefix_lens
         lens_masked = lens_to_track[mamba_track_mask]
-        offset_masked = track_ssm_src_offset[mamba_track_mask]
         dst_masked = mamba_track_indices[mamba_track_mask]
 
+        if isinstance(self, Mamba2AttnBackend):
+            return self._init_mamba2_track_ssm_indices(
+                mamba_cache_indices=mamba_cache_indices,
+                mamba_track_mask=mamba_track_mask,
+                extend_seq_lens=extend_seq_lens,
+                lens_masked=lens_masked,
+                dst_masked=dst_masked,
+                mamba_cache_chunk_size=mamba_cache_chunk_size,
+                forward_batch=forward_batch,
+            )
+
+        track_ssm_src_offset = self._track_ssm_src_offsets(
+            extend_seq_lens, mamba_cache_chunk_size
+        )
+        offset_masked = track_ssm_src_offset[mamba_track_mask]
         is_aligned = (lens_masked % mamba_cache_chunk_size) == 0
 
         # Aligned: last_recurrent_state from ssm_states.
@@ -313,7 +330,67 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_h_dst.to(self.device, non_blocking=True),
             track_ssm_final_src.to(self.device, non_blocking=True),
             track_ssm_final_dst.to(self.device, non_blocking=True),
+            None,
+            None,
+            None,
+            None,
         )
+
+    def _init_mamba2_track_ssm_indices(
+        self,
+        *,
+        mamba_cache_indices: torch.Tensor,
+        mamba_track_mask: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        lens_masked: torch.Tensor,
+        dst_masked: torch.Tensor,
+        mamba_cache_chunk_size: int,
+        forward_batch: ForwardBatch,
+    ):
+        track_end_lens = (
+            lens_masked // mamba_cache_chunk_size
+        ) * mamba_cache_chunk_size
+        extend_seq_lens_masked = extend_seq_lens[mamba_track_mask]
+
+        # Mamba2 physical chunks are over the flattened extend batch. A request's
+        # tracked prefix may end in the middle of such a physical chunk, so the
+        # mixer reconstructs those states from scan intermediates over [start, end).
+        is_final = track_end_lens == extend_seq_lens_masked
+        not_final = (~is_final) & (track_end_lens > 0)
+
+        track_ssm_final_src = mamba_cache_indices[mamba_track_mask][is_final]
+        track_ssm_final_dst = dst_masked[is_final]
+
+        track_rows = mamba_track_mask.nonzero(as_tuple=True)[0][not_final]
+        extend_start_locs = forward_batch.extend_start_loc.cpu()
+        track_ssm_varlen_start_locs = extend_start_locs[mamba_track_mask][not_final]
+        track_ssm_varlen_end_locs = track_ssm_varlen_start_locs + track_end_lens[
+            not_final
+        ].to(track_ssm_varlen_start_locs.dtype)
+        track_ssm_varlen_dst = dst_masked[not_final]
+
+        empty = torch.empty((0,), dtype=dst_masked.dtype)
+
+        return (
+            empty.to(self.device, non_blocking=True),
+            empty.to(self.device, non_blocking=True),
+            track_ssm_final_src.to(self.device, non_blocking=True),
+            track_ssm_final_dst.to(self.device, non_blocking=True),
+            track_ssm_varlen_start_locs.to(self.device, non_blocking=True),
+            track_ssm_varlen_end_locs.to(self.device, non_blocking=True),
+            track_ssm_varlen_dst.to(self.device, non_blocking=True),
+            track_rows.to(self.device, non_blocking=True),
+        )
+
+    def _track_ssm_src_offsets(
+        self, extend_seq_lens: torch.Tensor, mamba_cache_chunk_size: int
+    ) -> torch.Tensor:
+        """Starting offsets into the intermediate SSM-state tensor for each row."""
+        # FLA-style backends return per-request logical chunks.
+        num_h_states = (extend_seq_lens - 1) // mamba_cache_chunk_size + 1
+        offsets = torch.zeros_like(num_h_states)
+        offsets[1:] = torch.cumsum(num_h_states[:-1], dim=0)
+        return offsets
 
     def init_forward_metadata_capture_cpu_graph(
         self,
@@ -768,7 +845,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             use_triton_causal_conv or get_server_args().enable_page_major_kv_layout
         )
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-        mixer_out, intermediate_states = mixer.forward(
+        mixer_out, _ = mixer.forward(
             hidden_states=hidden_states,
             output=output,
             layer_cache=layer_cache,
@@ -779,18 +856,9 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         )
 
         if forward_batch.mamba_track_mask is not None:
-            if (
-                intermediate_states is not None
-                and forward_batch.mamba_track_mask is not None
-                and forward_batch.mamba_track_mask.any()
-            ):
-                self._track_mamba_state_extend(
-                    forward_batch,
-                    intermediate_states,
-                    layer_cache.temporal,
-                    self.forward_metadata,
-                )
-
+            # Mamba2 extend tracking is handled inside MambaMixer2 so it can
+            # reconstruct exact states from scan intermediates when the track
+            # boundary is not a flattened physical chunk boundary.
             if self.forward_metadata.num_decodes > 0:
                 num_decodes = self.forward_metadata.num_decodes
                 track_mamba_states_if_needed(

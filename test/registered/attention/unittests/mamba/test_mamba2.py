@@ -2,12 +2,13 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
+    Mamba2AttnBackend,
     MambaAttnBackendBase,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -39,6 +40,138 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+
+
+class _NonMamba2TrackBackend(MambaAttnBackendBase):
+    pass
+
+
+class TestMambaTrackSsmMetadata(CustomTestCase):
+    @staticmethod
+    def _track_forward_batch(extend_seq_lens: torch.Tensor):
+        extend_start_loc = torch.zeros_like(extend_seq_lens)
+        extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
+        return SimpleNamespace(
+            mamba_track_mask=torch.ones_like(extend_seq_lens, dtype=torch.bool),
+            extend_seq_lens=extend_seq_lens,
+            extend_start_loc=extend_start_loc,
+            mamba_track_indices=torch.arange(
+                10, 10 + len(extend_seq_lens), dtype=torch.int64
+            ),
+            mamba_track_seqlens=extend_seq_lens.to(torch.int64),
+            extend_prefix_lens=torch.zeros_like(extend_seq_lens, dtype=torch.int64),
+        )
+
+    @staticmethod
+    def _track_server_args():
+        return patch(
+            "sglang.srt.layers.attention.hybrid_linear_attn_backend.get_server_args",
+            return_value=SimpleNamespace(
+                mamba_cache_chunk_size=DEFAULT_MAMBA_CHUNK_SIZE
+            ),
+        )
+
+    def test_mamba2_non_final_tracking_uses_varlen_bounds(self):
+        backend = object.__new__(Mamba2AttnBackend)
+        backend.device = torch.device("cpu")
+        chunk = DEFAULT_MAMBA_CHUNK_SIZE
+        extend_seq_lens = torch.tensor(
+            [chunk * 3 + 2, chunk * 4 + 6, chunk * 5 + 10], dtype=torch.int32
+        )
+        forward_batch = self._track_forward_batch(extend_seq_lens)
+        mamba_cache_indices = torch.arange(100, 100 + len(extend_seq_lens))
+
+        with self._track_server_args():
+            (
+                track_ssm_h_src,
+                track_ssm_h_dst,
+                track_ssm_final_src,
+                track_ssm_final_dst,
+                track_ssm_varlen_start_locs,
+                track_ssm_varlen_end_locs,
+                track_ssm_varlen_dst,
+                track_ssm_varlen_rows,
+            ) = backend._init_track_ssm_indices(mamba_cache_indices, forward_batch)
+
+        self.assertEqual(track_ssm_h_src.tolist(), [])
+        self.assertEqual(track_ssm_h_dst.tolist(), [])
+        self.assertEqual(track_ssm_final_src.tolist(), [])
+        self.assertEqual(track_ssm_final_dst.tolist(), [])
+        expected_start_locs = forward_batch.extend_start_loc
+        expected_track_lens = (extend_seq_lens // chunk) * chunk
+        self.assertEqual(
+            track_ssm_varlen_start_locs.tolist(), expected_start_locs.tolist()
+        )
+        self.assertEqual(
+            track_ssm_varlen_end_locs.tolist(),
+            (expected_start_locs + expected_track_lens).tolist(),
+        )
+        self.assertEqual(track_ssm_varlen_dst.tolist(), [10, 11, 12])
+        self.assertEqual(track_ssm_varlen_rows.tolist(), [0, 1, 2])
+
+    def test_mamba2_final_tracking_uses_cache_state(self):
+        backend = object.__new__(Mamba2AttnBackend)
+        backend.device = torch.device("cpu")
+        chunk = DEFAULT_MAMBA_CHUNK_SIZE
+        extend_seq_lens = torch.tensor([chunk * 3], dtype=torch.int32)
+        forward_batch = self._track_forward_batch(extend_seq_lens)
+        mamba_cache_indices = torch.tensor([100], dtype=torch.int64)
+
+        with self._track_server_args():
+            (
+                track_ssm_h_src,
+                track_ssm_h_dst,
+                track_ssm_final_src,
+                track_ssm_final_dst,
+                track_ssm_varlen_start_locs,
+                track_ssm_varlen_end_locs,
+                track_ssm_varlen_dst,
+                track_ssm_varlen_rows,
+            ) = backend._init_track_ssm_indices(mamba_cache_indices, forward_batch)
+
+        self.assertEqual(track_ssm_h_src.tolist(), [])
+        self.assertEqual(track_ssm_h_dst.tolist(), [])
+        self.assertEqual(track_ssm_final_src.tolist(), [100])
+        self.assertEqual(track_ssm_final_dst.tolist(), [10])
+        self.assertEqual(track_ssm_varlen_start_locs.tolist(), [])
+        self.assertEqual(track_ssm_varlen_end_locs.tolist(), [])
+        self.assertEqual(track_ssm_varlen_dst.tolist(), [])
+        self.assertEqual(track_ssm_varlen_rows.tolist(), [])
+
+    def test_non_mamba2_tracking_preserves_per_request_chunks(self):
+        backend = object.__new__(_NonMamba2TrackBackend)
+        backend.device = torch.device("cpu")
+        chunk = DEFAULT_MAMBA_CHUNK_SIZE
+        extend_seq_lens = torch.tensor(
+            [chunk * 3 + 2, chunk * 4 + 6, chunk * 5 + 10], dtype=torch.int32
+        )
+        forward_batch = self._track_forward_batch(extend_seq_lens)
+        mamba_cache_indices = torch.arange(100, 100 + len(extend_seq_lens))
+
+        with self._track_server_args():
+            (
+                track_ssm_h_src,
+                track_ssm_h_dst,
+                track_ssm_final_src,
+                track_ssm_final_dst,
+                track_ssm_varlen_start_locs,
+                track_ssm_varlen_end_locs,
+                track_ssm_varlen_dst,
+                track_ssm_varlen_rows,
+            ) = backend._init_track_ssm_indices(mamba_cache_indices, forward_batch)
+
+        expected_num_h_states = (extend_seq_lens - 1) // chunk + 1
+        expected_offsets = torch.zeros_like(expected_num_h_states)
+        expected_offsets[1:] = torch.cumsum(expected_num_h_states[:-1], dim=0)
+        expected_h_src = expected_offsets + (extend_seq_lens // chunk)
+        self.assertEqual(track_ssm_h_src.tolist(), expected_h_src.tolist())
+        self.assertEqual(track_ssm_h_dst.tolist(), [10, 11, 12])
+        self.assertEqual(track_ssm_final_src.tolist(), [])
+        self.assertEqual(track_ssm_final_dst.tolist(), [])
+        self.assertIsNone(track_ssm_varlen_start_locs)
+        self.assertIsNone(track_ssm_varlen_end_locs)
+        self.assertIsNone(track_ssm_varlen_dst)
+        self.assertIsNone(track_ssm_varlen_rows)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")

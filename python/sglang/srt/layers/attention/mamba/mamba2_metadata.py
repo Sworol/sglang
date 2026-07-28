@@ -55,6 +55,10 @@ class ForwardMetadata:
     track_ssm_h_dst: Optional[torch.Tensor] = None
     track_ssm_final_src: Optional[torch.Tensor] = None
     track_ssm_final_dst: Optional[torch.Tensor] = None
+    track_ssm_varlen_start_locs: Optional[torch.Tensor] = None
+    track_ssm_varlen_end_locs: Optional[torch.Tensor] = None
+    track_ssm_varlen_dst: Optional[torch.Tensor] = None
+    track_ssm_varlen_rows: Optional[torch.Tensor] = None
 
     is_target_verify: bool = False
     draft_token_num: int = 1
@@ -193,6 +197,10 @@ class Mamba2Metadata(ForwardMetadata):
             track_ssm_h_dst=forward_metadata.track_ssm_h_dst,
             track_ssm_final_src=forward_metadata.track_ssm_final_src,
             track_ssm_final_dst=forward_metadata.track_ssm_final_dst,
+            track_ssm_varlen_start_locs=forward_metadata.track_ssm_varlen_start_locs,
+            track_ssm_varlen_end_locs=forward_metadata.track_ssm_varlen_end_locs,
+            track_ssm_varlen_dst=forward_metadata.track_ssm_varlen_dst,
+            track_ssm_varlen_rows=forward_metadata.track_ssm_varlen_rows,
             has_mamba_track_mask=forward_metadata.has_mamba_track_mask,
             num_decodes=len(seq_lens) if num_decodes is None else num_decodes,
             num_prefills=0,
@@ -284,6 +292,10 @@ class Mamba2Metadata(ForwardMetadata):
             track_ssm_h_dst=forward_metadata.track_ssm_h_dst,
             track_ssm_final_src=forward_metadata.track_ssm_final_src,
             track_ssm_final_dst=forward_metadata.track_ssm_final_dst,
+            track_ssm_varlen_start_locs=forward_metadata.track_ssm_varlen_start_locs,
+            track_ssm_varlen_end_locs=forward_metadata.track_ssm_varlen_end_locs,
+            track_ssm_varlen_dst=forward_metadata.track_ssm_varlen_dst,
+            track_ssm_varlen_rows=forward_metadata.track_ssm_varlen_rows,
             has_mamba_track_mask=forward_metadata.has_mamba_track_mask,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,

@@ -15,7 +15,11 @@ from packaging import version
 
 from .ssd_bmm import _bmm_chunk_fwd
 from .ssd_chunk_scan import _chunk_scan_fwd
-from .ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd, chunk_state_varlen
+from .ssd_chunk_state import (
+    _chunk_cumsum_fwd,
+    _chunk_state_fwd,
+    chunk_state_varlen,
+)
 from .ssd_state_passing import _state_passing_fwd
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
@@ -199,6 +203,7 @@ def mamba_chunk_scan_combined(
     return_final_states=False,
     return_varlen_states=False,
     return_intermediate_states=False,
+    return_scan_intermediates=False,
     state_dtype=None,
 ):
     """
@@ -248,28 +253,18 @@ def mamba_chunk_scan_combined(
             state_dtype=state_dtype,
         )
     )
+    outputs = []
     if return_intermediate_states:
-        if return_varlen_states:
-            varlen_states = rest[0]
-            if return_final_states:
-                return states, final_states, varlen_states
-            else:
-                return states, varlen_states
-        else:
-            if return_final_states:
-                return states, final_states
-            else:
-                return states
+        outputs.append(states)
+    if return_final_states:
+        outputs.append(final_states)
+    if return_varlen_states:
+        outputs.append(rest[0])
+    if return_scan_intermediates:
+        outputs.extend([dt_out, dA_cumsum])
 
-    if not return_varlen_states:
-        if not return_final_states:
-            return
-        else:
-            return final_states
-    else:
-        varlen_states = rest[0]
-        return (
-            (varlen_states)
-            if not return_final_states
-            else (final_states, varlen_states)
-        )
+    if not outputs:
+        return
+    if len(outputs) == 1:
+        return outputs[0]
+    return tuple(outputs)
